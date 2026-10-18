@@ -48,3 +48,11 @@ Credit: WJDDesigns/supreme-skelly (protocol.md + profiles.py), martinecker/Skell
 - 12ft Skelly profile (hardware-verified by supreme-skelly): head movement bit 0x02, single chest light channel, 20 eye icons (official app labels wrong).
 - Live query results: PIN "1234", volume 100, fw v14, ~8 file slots, one stock file "Default Sound 1.mp3".
 - `skelly.py`: auth + query client. Next: control ops (eyes/volume/movement), audio upload (C0–C5, 8kHz mono MP3, ≤20-char names).
+
+## ✅ Custom audio upload verified (2026-10-18 16:49)
+- `upload.py` pushes any MP3 via C0→C1→C2→C3 with JieLi auth and CRC-8/MAXIM framing.
+- Test file `GLaDOS1.mp3` (62.7 KB, 263 chunks @ 239 B, ~25 s) uploaded and confirmed; appears in D0 list as serial 9.
+- File-list reply layout corrected: per-file record, UTF-16LE name starts at byte 60 (59 was one short).
+- Device holds 8 stock sounds + uploads (30-file firmware corruption limit per community).
+- Audio prep for Skelly playback: 44.1 kHz mono 64 kbps CBR MP3 (supreme-skelly audio.py recipe), wake-tone prefix recommended so the amp is awake.
+- Next: jaw-synced playback (C6), TTS pipeline (Phase 3), POV camera + agent loop (Phase 4).

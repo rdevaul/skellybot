@@ -324,7 +324,8 @@ def get_random_auth_data() -> bytes:
 
 from typing import Protocol
 
-from qix_ble.errors import BadgeRejected
+class BadgeRejected(Exception):
+    """Device rejected an auth step."""
 
 # Markers de cada step en el primer byte del payload AE01/AE02
 STEP_CHALLENGE: int = 0x00   # phone→dev o dev→phone: <marker> ‖ 16B random/challenge
