@@ -39,3 +39,12 @@
 - Cipher ported from ElectronicCats/jieli-ble-badge-research `qix_ble/auth.py` (verified byte-exact vs device).
 - Auth script: `1-recon/skelly_auth.py` (to be moved into repo); handshake replayable on every connection.
 - Implication: full JieLi stack available — RCSP commands, filesystem, and **audio file upload** are all reachable with the stock framing (FE/fe-dc-ba obfuscated RCSP frames).
+
+## 🔓🔓 PROTOCOL FULLY DECODED via community RE (2026-10-18 16:33)
+Credit: WJDDesigns/supreme-skelly (protocol.md + profiles.py), martinecker/SkellyUltraWebController (original RE), ElectronicCats/jieli-ble-badge-research (auth cipher).
+
+- Frame: `AA <cmd> <payload ≥8B>` + CRC-8/MAXIM; replies `BB <cmd>`; 40 ms write spacing.
+- JieLi raw auth (default static key) still required/accepted; vendored in `vendor/jli_auth.py`.
+- 12ft Skelly profile (hardware-verified by supreme-skelly): head movement bit 0x02, single chest light channel, 20 eye icons (official app labels wrong).
+- Live query results: PIN "1234", volume 100, fw v14, ~8 file slots, one stock file "Default Sound 1.mp3".
+- `skelly.py`: auth + query client. Next: control ops (eyes/volume/movement), audio upload (C0–C5, 8kHz mono MP3, ≤20-char names).
