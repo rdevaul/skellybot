@@ -32,3 +32,10 @@
 - Conclusion: control is gated behind an encrypted auth handshake (JieLi RCSP-style, AES).
 - **Decisive next step:** nRF Connect capture of Decore Pro app pairing flow (iPhone), export handshake bytes → replay from bleak.
 - Parallel offline work: audit JieLi SDK default key/handshake for exploitable defaults.
+
+## 🔓 AUTH BREAKTHROUGH (2026-10-18 16:30)
+- Device uses the stock **JieLi raw auth handshake** on AE01/AE02 with the **default static key** (`06775F87918DD423005DF1D8CF0C142B`).
+- 6-step handshake completed: `02 70 61 73 73` ("\x02pass") received on step 6 → **AUTH SUCCESS**.
+- Cipher ported from ElectronicCats/jieli-ble-badge-research `qix_ble/auth.py` (verified byte-exact vs device).
+- Auth script: `1-recon/skelly_auth.py` (to be moved into repo); handshake replayable on every connection.
+- Implication: full JieLi stack available — RCSP commands, filesystem, and **audio file upload** are all reachable with the stock framing (FE/fe-dc-ba obfuscated RCSP frames).
