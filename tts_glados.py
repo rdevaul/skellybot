@@ -23,7 +23,7 @@ sf.write("{remote}", samples, sr)
 PYEOF"""
     subprocess.run(["ssh", "-i", KEY, "-o", "BatchMode=yes", GLADOS, cmd], check=True)
     wav = subprocess.run(
-        ["ssh", "-i", KEY, "-o", "BatchMode=yes", GLADOS, f"base64 {remote}"],
+        ["ssh", "-i", KEY, "-o", "BatchMode=yes", GLADOS, f"base64 -i {remote}"],
         check=True, capture_output=True,
     ).stdout
     subprocess.run(["ssh", "-i", KEY, GLADOS, f"rm -f {remote}"], check=False)

@@ -1,6 +1,6 @@
 """skelly_speak — one command: text in, 12-foot skeleton says it out loud.
 
-Pipeline: macOS `say` → 64 kbps mono MP3 → chunked upload (C0-C3) → play (C6).
+Pipeline: Kokoro-82M on old GLaDOS → 64 kbps mono MP3 → chunked upload (C0-C3) → play (C6).
 Names auto-rotate to dodge the firmware's prefix/name quirks and the 30-file
 corruption limit (oldest custom clip is deleted first).
 
@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from skelly import ADDR_DEFAULT, Cmd, Skelly, log
+import tts_glados
 
 UPLOAD_SETTLE_S = 8.0   # firmware needs time to flush after C3; playback before this can silently fail
 MAX_CUSTOM_FILES = 25   # firmware corrupts custom sounds near 30 — recycle before we get there
@@ -23,11 +24,9 @@ VOCAB = "skelly"        # non-colliding prefix for our clips
 
 
 def tts(text: str, mp3_path: str) -> None:
+    """Kokoro-82M on old GLaDOS — better prosody, zero Spark RAM."""
     wav = tempfile.mktemp(suffix=".wav")
-    subprocess.run(
-        ["say", "-v", "Samantha", "-r", "165", "--data-format=LEI16@22050", "-o", wav, text],
-        check=True,
-    )
+    Path(wav).write_bytes(tts_glados.synth(text))
     subprocess.run(
         ["ffmpeg", "-y", "-v", "error", "-i", wav, "-ac", "1", "-ar", "44100",
          "-b:a", "64k", "-c:a", "libmp3lame", "-f", "mp3", mp3_path],
