@@ -17,6 +17,7 @@ from bleak import BleakClient
 SERVICE = "0000ae00-0000-1000-8000-00805f9b34fb"
 WRITE = "0000ae01-0000-1000-8000-00805f9b34fb"
 NOTIFY = "0000ae02-0000-1000-8000-00805f9b34fb"
+ADDR_DEFAULT = "B3C1F919-364D-6A68-2C9A-0286CB3F5507"
 
 # ── JieLi raw auth (ported from jieli-ble-badge-research qix_ble/auth.py) ────
 sys.path.insert(0, str(Path(__file__).parent / "vendor"))
@@ -145,7 +146,7 @@ class Skelly:
 
 
 async def main() -> None:
-    addr = "B3C1F919-364D-6A68-2C9A-0286CB3F5507"
+    addr = ADDR_DEFAULT
     async with Skelly(addr) as sk:
         log(f"connected; auth: {'OK' if await sk.auth() else 'FAILED'}")
         for name, cmd in QUERIES.items():

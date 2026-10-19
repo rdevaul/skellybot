@@ -56,3 +56,9 @@ Credit: WJDDesigns/supreme-skelly (protocol.md + profiles.py), martinecker/Skell
 - Device holds 8 stock sounds + uploads (30-file firmware corruption limit per community).
 - Audio prep for Skelly playback: 44.1 kHz mono 64 kbps CBR MP3 (supreme-skelly audio.py recipe), wake-tone prefix recommended so the amp is awake.
 - Next: jaw-synced playback (C6), TTS pipeline (Phase 3), POV camera + agent loop (Phase 4).
+
+## skelly_speak wrapper (2026-10-18 17:53)
+- `skelly_speak.py "<text>"`: say → 64k mono MP3 → C0-C3 upload → C6 play, one command.
+- Transient-playback root cause: playback too soon after C3 — firmware needs ~8 s to flush; wrapper settles before playing.
+- Clip auto-recycling: `skellyHHMMSS.mp3` names (no prefix collisions), oldest deleted at 25 clips (30-file corruption limit).
+- Verified live: serial 11 played. Phase 3 ✅ (TTS pipeline); Phase 2 daemon = trivial wrapper around this.
