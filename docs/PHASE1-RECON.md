@@ -70,3 +70,9 @@ Credit: WJDDesigns/supreme-skelly (protocol.md + profiles.py), martinecker/Skell
 - Voice `af_heart` live-tested: SkellyNewVoice.mp3 uploaded + played (serial 12), confirmed audible.
 - `tts_glados.py`: SSH-synth helper (b64 text out, b64 wav back) for use from skelly_speak.
 - Note: SSH agent forwarding (`ssh -A`) works between Macs and Spark with id_ed25519_glados for future hops.
+
+## TTS backend switched to OpenAI (2026-10-18 18:48)
+- Constraint from Rich: no inference on Spark or old GLaDOS.
+- `tts_openai.py`: gpt-4o-mini-tts (voice: onyx, override via SKELLY_TTS_VOICE), transcodes to device spec (64k mono CBR).
+- skelly_speak default backend = OpenAI; live-tested, serial 14.
+- tts_glados.py (Kokoro) retained as library; not wired in.
