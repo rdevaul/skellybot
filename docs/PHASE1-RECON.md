@@ -62,3 +62,11 @@ Credit: WJDDesigns/supreme-skelly (protocol.md + profiles.py), martinecker/Skell
 - Transient-playback root cause: playback too soon after C3 — firmware needs ~8 s to flush; wrapper settles before playing.
 - Clip auto-recycling: `skellyHHMMSS.mp3` names (no prefix collisions), oldest deleted at 25 clips (30-file corruption limit).
 - Verified live: serial 11 played. Phase 3 ✅ (TTS pipeline); Phase 2 daemon = trivial wrapper around this.
+
+## TTS pipeline on old GLaDOS (2026-10-18 18:42)
+- qwen3.8:27b-mlx on old GLaDOS given 5-min keep_alive (unloads after idle; gemma4:26b left pinned per cron-fallback role).
+- Kokoro-82M (kokoro-onnx) deployed at ~/tts on old GLaDOS: model kokoro-v1.0.onnx + voices-v1.0.bin, venv python3.13.
+- Perf: RTF 0.257 (4.9 s audio in 1.26 s) on M4 Pro CPU — 4x realtime, no Spark RAM touched.
+- Voice `af_heart` live-tested: SkellyNewVoice.mp3 uploaded + played (serial 12), confirmed audible.
+- `tts_glados.py`: SSH-synth helper (b64 text out, b64 wav back) for use from skelly_speak.
+- Note: SSH agent forwarding (`ssh -A`) works between Macs and Spark with id_ed25519_glados for future hops.
