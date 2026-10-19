@@ -49,3 +49,4 @@ Thumbs.db
 *.pcap
 *.log
 captures/
+parler-venv/
