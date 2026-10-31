@@ -106,10 +106,12 @@ class PeopleWatcher(threading.Thread):
         self.last_true = 0.0
         self.last_false = time.time()
 
+    SUB_LIFETIME_S = 300   # Tapo keeps subscription objects around; stay well under
+
     def _subscribe(self) -> str:
         r = _soap(f"http://{CAM}:{ONVIF_PORT}/onvif/service",
                   "http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest",
-                  "<tev:CreatePullPointSubscription><tev:InitialTerminationTime>PT900S</tev:InitialTerminationTime>"
+                  f"<tev:CreatePullPointSubscription><tev:InitialTerminationTime>PT{self.SUB_LIFETIME_S}S</tev:InitialTerminationTime>"
                   "</tev:CreatePullPointSubscription>", self.password)
         m = re.search(r"Address>([^<]+)<", r)
         if not m:
@@ -117,18 +119,27 @@ class PeopleWatcher(threading.Thread):
         return m.group(1)
 
     def run(self):
+        backoff = 5
         while True:
             try:
                 addr = self._subscribe()
+                backoff = 5
                 born = time.time()
                 log(f"onvif: subscribed {addr}")
                 fails = 0
-                while time.time() - born < 840 and fails < 30:   # resubscribe before PT900S expiry
+                while time.time() - born < self.SUB_LIFETIME_S - 30 and fails < 30:
                     try:
                         r = _soap(addr, "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest",
                                   "<tev:PullMessages><tev:Timeout>PT5S</tev:Timeout><tev:MessageLimit>20</tev:MessageLimit>"
                                   "</tev:PullMessages>", self.password, to=addr, timeout=10)
                         fails = 0
+                    except urllib.error.HTTPError as e:
+                        if e.code == 400:      # subscription invalidated — recreate now
+                            raise RuntimeError("pull got 400, subscription stale")
+                        fails += 1
+                        time.sleep(0.5)
+                        self._decay()
+                        continue
                     except Exception:
                         # Tapo drops the long-poll when it has nothing to say; that's normal.
                         fails += 1
@@ -143,8 +154,9 @@ class PeopleWatcher(threading.Thread):
                             self._update(v.group(1) == "true")
                     self._decay()
             except Exception as e:
-                log(f"onvif: subscription error {e!r}; retry in 5s")
-                time.sleep(5)
+                log(f"onvif: subscription error {e!r}; retry in {backoff}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     def _update(self, people: bool):
         now = time.time()
@@ -228,8 +240,8 @@ def tts(line: str, out_wav: str) -> None:
 
 def play(wav: str) -> dict:
     name = f"/tmp/watch_{int(time.time() * 1000)}.wav"
-    subprocess.run(["scp", "-q", "-i", KEY, "-o", f"ControlPath={CTL_DIR}/%r@%h:%p", wav, f"{PI}:{name}"],
-                   check=True, timeout=30)
+    subprocess.run(["scp", "-q", "-i", KEY, "-o", "ControlMaster=auto", "-o", f"ControlPath={CTL_DIR}/%r@%h:%p",
+                    "-o", "ControlPersist=600", wav, f"{PI}:{name}"], check=True, timeout=60)
     r = subprocess.run(ssh_base(PI) + [f"~/skelly-venv/bin/python ~/skelly_client.py play --prenorm {name}; rm -f {name}"],
                        capture_output=True, text=True, timeout=240)
     try:
