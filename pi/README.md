@@ -66,6 +66,26 @@ systemctl --user start pipewire pipewire-pulse wireplumber
 The BLE address is a **rotating RPA** — always scan by name (`12ft Skelly`), never hardcode.
 The classic BT address (`D3:A6:5D:78:BD:19`) is stable and advertised only briefly after each `0xFD 01`.
 
+## Current Pi state (2026-10-31)
+
+The deployed Pi (`skelly-pi`, tailnet 100.84.5.92) runs **Raspbian 11 Bullseye
+(32-bit userland) with PulseAudio 14 + pulseaudio-module-bluetooth**, not the
+Bookworm/PipeWire stack `setup.sh` assumes. The orchestrator handles both:
+the A2DP sink is `bluez_sink.<MAC>.a2dp_sink` on PulseAudio and
+`bluez_output.<MAC>.1` on PipeWire. PulseAudio there defaults to 44.1 kHz.
+Run `--preflight` first; it checks tools, audio server, bluez module and bond
+state without sending anything to the skull.
+
+### Bond reuse (do NOT re-pair every session)
+
+The classic `12ft Skelly(Live)` device only needs to be paired **once**
+(legacy PIN `1234`, answered by `skelly_bt_agent.py`). After that each session
+is just `FD 01` → `bluetoothctl connect` (≤4 tries, `FD 01` re-sent between
+tries), matching OpenSkelly `connect_live()`. Earlier code ran
+`bluetoothctl remove` at the start of every session, destroying the bond.
+Use `--repair` only if the bond is genuinely broken.
+Back up `/var/lib/bluetooth/` before reflashing the Pi to keep the bond.
+
 ## ⚠️ REQUIRED: 44.1 kHz SBC (silent-failure gotcha)
 
 The Skelly hardware produces **no audio at 48 kHz**, even though the A2DP transport
@@ -90,13 +110,13 @@ The orchestrator logs a loud warning if the BT sink is not 44.1 kHz.
 
 | Step | Action | Opcode / tool | Status |
 |------|--------|---------------|--------|
-| a | Stop onboard-file playback | BLE `C6` (payload TODO-verify) | TODO-verify |
+| a | Stop onboard-file playback + reset anim | BLE `C6` (zero payload), `FC 00` | frames byte-identical to OpenSkelly |
 | b | Enable classic radio | BLE `FD 01` (kept alive every 4s during pairing) | verified |
-| c | Pair + connect A2DP (PIN 1234) | bluetoothctl + D-Bus agent | verified |
-| d | Select classic BT audio source | BLE `FE 01` | TODO-verify |
-| e | Stream audio | `pacat` (s16le 44100 stereo via ffmpeg); falls back to pw-play/paplay | |
-| f | Enter live animation mode | BLE `FC 01` (sent once stream is flowing) | TODO-verify |
-| g | Volume | BLE `FA <0-100>` (`--volume`, default 80; range TODO-verify) | opcode from skelly.py |
+| c | Connect A2DP (pair only if no bond) | `bluetoothctl connect`; agent for one-time PIN | pairing verified 10-30 |
+| d | Select classic BT audio source | BLE `FE 01`, then wait for A2DP sink | OpenSkelly-verified |
+| e | Stream audio | ffmpeg loudnorm → `pacat` s16le 44100 stereo to the BT sink (refuses to fall back to the analog jack) | |
+| f | Enter live animation mode | BLE `FC 01` (~0.3s after stream starts) | OpenSkelly-verified |
+| g | Volume | BLE `FA <0-100>` right after `FC 01` (`--volume`, default 80) | OpenSkelly sends `FA 64` |
 
 `0xCA` head start/stop is still sent alongside `FC 01` (disable with `--no-head`).
 Whether `FC 01` subsumes head motion is **unverified** — A/B on hardware with and
@@ -147,6 +167,8 @@ No audio, no A2DP pairing. Good for verifying BLE link and movement.
 | `--mode live\|upload\|hybrid` | Playback path (see Modes) |
 | `--volume <0-100>` | FA volume (default 80) |
 | `--capacity` | Storage capacity probe |
+| `--preflight` | Local checks only, no radio traffic |
+| `--repair` | Remove + re-pair the Live device (default reuses bond) |
 
 ## Operator Sequence (Porch Test Tonight)
 

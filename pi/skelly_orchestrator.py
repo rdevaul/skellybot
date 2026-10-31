@@ -189,20 +189,34 @@ async def scan_for_skelly(timeout: float = 10.0) -> str | None:
 async def ble_connect_auth():
     """Scan + connect + auth. Returns (client, rx_queue) or (None, None).
 
-    GUARDRAIL: NO retry loops around BLE connect. Stacked retries cause
-    connect timeouts and constant chirping on this firmware. Power-cycle instead.
+    Pi BlueZ workaround: hold the discovered BLEDevice object and connect
+    while discovery is still active; the BlueZ device object is removed
+    the moment discovery stops, so scanning-then-connecting-by-address fails.
     """
-    ble_addr = await scan_for_skelly(timeout=10.0)
-    if not ble_addr:
+    held = []
+    def _cb(dev, adv):
+        name = dev.name or adv.local_name or ""
+        if "skell" in name.lower():
+            held.append(dev)
+    scanner = BleakScanner(detection_callback=_cb)
+    await scanner.start()
+    for _ in range(15):
+        await asyncio.sleep(1)
+        if len(held) >= 3:
+            break
+    if not held:
         log("FATAL: Skelly BLE device not found. Check power and proximity.")
+        await scanner.stop()
         return None, None
-    log(f"connecting to BLE {ble_addr}...")
+    ble_addr = held[-1].address
+    log(f"connecting to BLE {ble_addr} (discovery held open)...")
     try:
-        client = BleakClient(ble_addr, timeout=30.0)
+        client = BleakClient(held[-1], timeout=30.0)
         await client.connect()
     except Exception as e:
         log(f"BLE connect FAILED: {e}")
         log("ADVICE: power-cycle the Skelly and try again. Do NOT retry — stacked retries cause chirping.")
+        await scanner.stop()
         return None, None
     log("BLE connected ✅")
 
@@ -265,8 +279,72 @@ async def run_btctl_batch(cmds: list[str], timeout: float = 10.0) -> str:
     return out.decode(errors="replace")
 
 
-async def pair_classic_bt(classic_addr: str, keepalive_fn) -> bool:
-    """Pair + connect the classic BT A2DP endpoint.
+async def _btctl(*args: str, timeout: float = 15.0) -> str:
+    """Run one non-interactive bluetoothctl command; return combined output."""
+    proc = await asyncio.create_subprocess_exec(
+        "bluetoothctl", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return "(timeout)"
+    return out.decode(errors="replace")
+
+
+async def classic_info(bt_mac: str) -> dict:
+    out = await _btctl("info", bt_mac, timeout=5.0)
+    return {
+        "known": "not available" not in out and "Device " in out,
+        "paired": "Paired: yes" in out,
+        "trusted": "Trusted: yes" in out,
+        "connected": "Connected: yes" in out,
+    }
+
+
+async def connect_classic_bt(classic_addr: str, keepalive_fn, repair: bool = False) -> bool:
+    """Bring up the classic A2DP link to the skull.
+
+    Mirrors OpenSkelly connect_live(): the bond is made ONCE and reused;
+    each session is just FD 01 → `bluetoothctl connect` (≤4 tries, FD 01
+    re-sent between tries). We only pair if BlueZ has no bond (or --repair).
+    NEVER `remove` the device by default — that destroys the bond.
+    """
+    bt_mac = _bt_mac(classic_addr)
+    info = await classic_info(bt_mac)
+    log(f"classic {bt_mac}: {info}")
+    if info["connected"]:
+        log("classic already connected ✅")
+        return True
+    if repair or not info["paired"]:
+        log("no usable bond → pairing flow" + (" (--repair)" if repair else ""))
+        if not await pair_classic_bt(classic_addr, keepalive_fn, remove_first=repair):
+            return False
+        info = await classic_info(bt_mac)
+        if info["connected"]:
+            return True
+    if not info["trusted"]:
+        await _btctl("trust", bt_mac, timeout=5.0)
+
+    last = ""
+    for attempt in range(1, 5):
+        log(f"bluetoothctl connect {bt_mac} (try {attempt}/4)")
+        last = (await _btctl("connect", bt_mac, timeout=15.0)).strip()
+        log(f"  {last.splitlines()[-1] if last else '(no output)'}")
+        if (await classic_info(bt_mac))["connected"]:
+            log("classic A2DP link UP ✅")
+            return True
+        await asyncio.sleep(1.0)
+        await keepalive_fn()
+    log(f"classic connect FAILED: {last[-200:]}")
+    return False
+
+
+async def pair_classic_bt(classic_addr: str, keepalive_fn, remove_first: bool = False) -> bool:
+    """One-time legacy-PIN pairing (agent answers PIN). Only used when no bond exists.
 
     Returns True only if pairing succeeded or `info` reports Connected: yes.
     keepalive_fn re-sends FD 01 to hold the classic advertising window open.
@@ -284,11 +362,12 @@ async def pair_classic_bt(classic_addr: str, keepalive_fn) -> bool:
 
     proc = None
     try:
-        log(f"removing old pairing for {bt_mac}...")
-        out = await run_btctl_batch([f"remove {bt_mac}"], timeout=5.0)
-        log(f"  {out.strip()[:120]}")
-        await asyncio.sleep(0.5)
-        await run_btctl_batch(["power on", "discoverable on"], timeout=5.0)
+        if remove_first:
+            log(f"--repair: removing old pairing for {bt_mac}...")
+            out = await run_btctl_batch([f"remove {bt_mac}"], timeout=5.0)
+            log(f"  {out.strip()[:120]}")
+            await asyncio.sleep(0.5)
+        await run_btctl_batch(["power on"], timeout=5.0)
         log("  adapter ready")
 
         log("starting classic BT discovery...")
@@ -299,7 +378,7 @@ async def pair_classic_bt(classic_addr: str, keepalive_fn) -> bool:
             stderr=asyncio.subprocess.STDOUT,
         )
         assert proc.stdin and proc.stdout
-        proc.stdin.write(b"power on\nagent KeyboardDisplay\ndefault-agent\nscan on\n")
+        proc.stdin.write(b"power on\nscan on\n")
         await proc.stdin.drain()
 
         mac_norm = bt_mac.replace(":", "").upper()
@@ -330,10 +409,6 @@ async def pair_classic_bt(classic_addr: str, keepalive_fn) -> bool:
         if not found:
             log("device not seen in scan — attempting direct pair anyway")
 
-        proc.stdin.write(f"trust {bt_mac}\n".encode())
-        await proc.stdin.drain()
-        await asyncio.sleep(0.5)
-
         log(f"pairing with {bt_mac} (agent provides PIN={A2DP_PIN})...")
         proc.stdin.write(f"pair {bt_mac}\n".encode())
         await proc.stdin.drain()
@@ -347,7 +422,7 @@ async def pair_classic_bt(classic_addr: str, keepalive_fn) -> bool:
                 line = line.decode(errors="replace").strip()
                 if line:
                     log(f"bt: {line}")
-                if "Pairing successful" in line:
+                if "Pairing successful" in line or "AlreadyExists" in line:
                     paired = True
                     break
                 if "failed" in line.lower() and "pair" in line.lower():
@@ -359,38 +434,14 @@ async def pair_classic_bt(classic_addr: str, keepalive_fn) -> bool:
                 await keepalive_fn()
                 last_ka = time.time()
 
-        log("pairing successful ✅" if paired else "WARNING: pairing outcome unclear")
-
-        log(f"connecting A2DP to {bt_mac}...")
-        proc.stdin.write(f"connect {bt_mac}\n".encode())
-        await proc.stdin.drain()
-        await asyncio.sleep(3)
-        await keepalive_fn()
-
-        proc.stdin.write(f"info {bt_mac}\n".encode())
-        await proc.stdin.drain()
-        connected = False
-        for _ in range(25):
-            try:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
-                line = line.decode(errors="replace").strip()
-                if line:
-                    log(f"info: {line}")
-                    if "Connected: yes" in line:
-                        connected = True
-            except asyncio.TimeoutError:
-                break
-
-        proc.stdin.write(b"quit\n")
+        proc.stdin.write(f"trust {bt_mac}\nquit\n".encode())
         await proc.stdin.drain()
         try:
             await asyncio.wait_for(proc.wait(), timeout=3.0)
         except asyncio.TimeoutError:
             proc.kill()
-
-        ok = connected or paired
-        log(f"classic handshake result: paired={paired} connected={connected}")
-        return ok
+        log("pairing successful ✅" if paired else "WARNING: pairing outcome unclear")
+        return paired or (await classic_info(bt_mac))["paired"]
 
     except Exception as e:
         log(f"classic BT pairing error: {e}")
@@ -398,33 +449,61 @@ async def pair_classic_bt(classic_addr: str, keepalive_fn) -> bool:
     finally:
         if proc and proc.returncode is None:
             try:
-                proc.stdin.write(b"quit\n")
-                await proc.stdin.drain()
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except Exception:
                 proc.kill()
+            except ProcessLookupError:
+                pass
         try:
             agent_proc.terminate()
             await asyncio.wait_for(agent_proc.wait(), timeout=3.0)
         except Exception:
-            agent_proc.kill()
+            try:
+                agent_proc.kill()
+            except ProcessLookupError:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Audio streaming via PipeWire / PulseAudio (pacat preferred)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def find_pipewire_bt_sink() -> str | None:
-    """Find the PipeWire Bluetooth A2DP sink name (bluez_output.*)."""
+def find_pipewire_bt_sink(mac: str | None = None) -> str | None:
+    """Find the Bluetooth A2DP sink.
+
+    PipeWire names it bluez_output.<MAC>.1; PulseAudio (Bullseye Pi) names it
+    bluez_sink.<MAC>.a2dp_sink. Accept both; prefer one matching `mac`.
+    """
+    want = mac.replace(":", "_").upper() if mac else None
     try:
         result = subprocess.run(["pactl", "list", "short", "sinks"],
                                 capture_output=True, text=True, timeout=5)
+        cands = []
         for line in result.stdout.splitlines():
             parts = line.split("\t")
-            if len(parts) >= 2 and "bluez_output" in parts[1].lower():
-                return parts[1]
+            if len(parts) >= 2 and parts[1].lower().startswith(("bluez_output", "bluez_sink")):
+                cands.append(parts[1])
+        for c in cands:
+            if want and want in c.upper():
+                return c
+        return cands[0] if cands else None
     except Exception as e:
         log(f"pactl error: {e}")
+    return None
+
+
+def wait_for_bt_sink(mac: str, timeout: float = 12.0) -> str | None:
+    """Poll for the A2DP sink; on PulseAudio, nudge the card into a2dp_sink."""
+    end = time.time() + timeout
+    card = f"bluez_card.{mac.replace(':', '_').upper()}"
+    nudged = False
+    while time.time() < end:
+        sink = find_pipewire_bt_sink(mac)
+        if sink:
+            return sink
+        if not nudged and time.time() > end - timeout / 2:
+            subprocess.run(["pactl", "set-card-profile", card, "a2dp_sink"],
+                           capture_output=True, timeout=5)
+            nudged = True
+        time.sleep(0.5)
     return None
 
 
@@ -448,21 +527,26 @@ def log_sink_rate(sink: str | None) -> None:
         pass
 
 
-def stream_audio_pipewire(audio_path: str, timeout: float = 120.0) -> bool:
-    """Stream audio to the BT sink. Order: pacat (via ffmpeg decode) → pw-play → paplay."""
-    sink = find_pipewire_bt_sink()
-    if sink:
-        log(f"using BT sink: {sink}")
-        log_sink_rate(sink)
-    else:
-        log("WARNING: no BT sink found — streaming to default output")
+def stream_audio_pipewire(audio_path: str, timeout: float = 120.0, sink: str | None = None) -> bool:
+    """Stream audio to the BT sink. Order: pacat (via ffmpeg decode) → pw-play → paplay.
+
+    Refuses to play if no BT sink exists (otherwise audio silently goes to the
+    Pi's analog jack and the run looks like a success).
+    """
+    sink = sink or find_pipewire_bt_sink()
+    if not sink:
+        log("FAILED: no Bluetooth sink — refusing to play to the analog jack")
+        return False
+    log(f"using BT sink: {sink}")
+    log_sink_rate(sink)
 
     # (e) pacat: decode to raw s16le 44.1k stereo and pipe in
     try:
         log("streaming via pacat (ffmpeg → s16le 44100 stereo)")
         ff = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-i", audio_path, "-f", "s16le",
-             "-ar", "44100", "-ac", "2", "-"],
+            ["ffmpeg", "-v", "error", "-i", audio_path,
+             "-af", "loudnorm=I=-10:TP=-1:LRA=11,apad=pad_dur=0.75",
+             "-f", "s16le", "-ar", "44100", "-ac", "2", "-"],
             stdout=subprocess.PIPE)
         pa_cmd = ["pacat", "--playback", "--format=s16le", "--rate=44100", "--channels=2"]
         if sink:
@@ -741,15 +825,17 @@ async def run_capacity() -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def live_session(client, rx, audio_path: str, classic_addr: str,
-                       head_motion: bool, volume: int, max_attempts: int = 1) -> bool:
-    """Live path on an existing authed BLE link.
+                       head_motion: bool, volume: int, max_attempts: int = 1,
+                       repair: bool = False) -> bool:
+    """Live path on an existing authed BLE link (OpenSkelly connect_live order).
 
-    (a) stop C6 → (b) FD 01 → (c) pair+connect → (d) FE 01 → (e) pacat →
-    (f) FC 01 → (g) FA volume. Head 0xCA start/stop kept alongside FC 01.
-    Returns False if classic handshake failed after max_attempts.
+    (a) C6 stop file + FC 00 → (b) FD 01 (wait ACK) → (c) bluetoothctl connect
+    (bond reused; pair only if missing) → (d) FE 01 → wait sink → (e) pacat →
+    (f) FC 01 → (g) FA volume.
     """
     log("PATH: LIVE (A2DP)")
     await stop_onboard_playback(client, rx)                       # (a)
+    await tx(client, ENTER_LIVE_ANIM, bytes([0x00]), "(a) FC 00 (reset live anim)", rx)
 
     keepalive = LiveKeepalive(client)
     classic_ok = False
@@ -759,8 +845,9 @@ async def live_session(client, rx, audio_path: str, classic_addr: str,
         stop = asyncio.Event()
         ka = asyncio.create_task(keepalive.run_loop(stop))
         await asyncio.sleep(0.5)
-        log(f"(c) pair+connect classic {classic_addr}")
-        classic_ok = await pair_classic_bt(classic_addr, keepalive.send_once)
+        log(f"(c) connect classic {classic_addr}")
+        classic_ok = await connect_classic_bt(classic_addr, keepalive.send_once,
+                                              repair=repair and attempt == 1)
         stop.set()
         try:
             await asyncio.wait_for(ka, timeout=5.0)
@@ -773,32 +860,40 @@ async def live_session(client, rx, audio_path: str, classic_addr: str,
         await tx(client, ENABLE_LIVE, bytes([0x00]), "FD 00 (abort live)")
         return False
 
-    log("waiting for BT sink to settle...")
-    await asyncio.sleep(3)
     drain(rx)
+    await select_classic_source(client, rx)                       # (d) right after connect
+    log("waiting for A2DP sink...")
+    sink = await asyncio.get_running_loop().run_in_executor(
+        None, wait_for_bt_sink, _bt_mac(classic_addr), 12.0)
+    if not sink:
+        log("FAILED: classic link up but no A2DP sink appeared (pactl list sinks)")
+        await tx(client, ENABLE_LIVE, bytes([0x00]), "FD 00 (abort live)")
+        return False
+    log(f"A2DP sink ready: {sink}")
 
-    await select_classic_source(client, rx)                       # (d)
-    await apply_volume(client, rx, volume)                        # (g) volume set up-front, before audio
     if head_motion:
         await head_start(client)                                  # 0xCA alongside FC 01
         await asyncio.sleep(0.3)
 
     stream_task = asyncio.get_running_loop().run_in_executor(     # (e) start streaming
-        None, stream_audio_pipewire, audio_path, 120.0)
-    await asyncio.sleep(1.0)                                      # let pacat open the transport
+        None, stream_audio_pipewire, audio_path, 120.0, sink)
+    await asyncio.sleep(0.3)                                      # let pacat open the transport
     await enter_live_animation(client, rx)                        # (f) FC 01 while audio flows
+    await asyncio.sleep(0.08)
+    await apply_volume(client, rx, volume)                        # (g) volume after FC 01 (OpenSkelly order)
     audio_ok = await stream_task
 
     if head_motion:
         await head_stop(client)
     await tx(client, ENTER_LIVE_ANIM, bytes([0x00]), "FC 00 (exit live animation)")
     await tx(client, ENABLE_LIVE, bytes([0x00]), "FD 00 (disable live)")
+    await _btctl("disconnect", _bt_mac(classic_addr), timeout=10.0)
     log(f"LIVE path executed — audio {'OK' if audio_ok else 'FAILED'}")
     return audio_ok
 
 
 async def run_session(mode: str, audio_path: str, classic_addr: str | None,
-                      head_motion: bool, volume: int) -> bool:
+                      head_motion: bool, volume: int, repair: bool = False) -> bool:
     classic_addr = classic_addr or CLASSIC_DEFAULT_ADDR
     client, rx = await ble_connect_auth()
     if not client:
@@ -809,12 +904,12 @@ async def run_session(mode: str, audio_path: str, classic_addr: str | None,
             log(f"RESULT: path=UPLOAD ok={ok}")
             return ok
         if mode == "live":
-            ok = await live_session(client, rx, audio_path, classic_addr, head_motion, volume, 1)
+            ok = await live_session(client, rx, audio_path, classic_addr, head_motion, volume, 1, repair)
             log(f"RESULT: path=LIVE ok={ok}")
             return ok
         # hybrid
         ok = await live_session(client, rx, audio_path, classic_addr, head_motion, volume,
-                                HYBRID_MAX_LIVE_FAILS)
+                                HYBRID_MAX_LIVE_FAILS, repair)
         if ok:
             log("RESULT: path=LIVE (hybrid, no fallback needed)")
             return True
@@ -841,18 +936,53 @@ async def run_test_head(seconds: float) -> bool:
         await ble_close(client)
 
 
+def run_preflight(classic_addr: str | None) -> bool:
+    """No-radio-traffic checks: tools, audio server, BT module, bond state."""
+    import shutil
+    mac = _bt_mac(classic_addr or CLASSIC_DEFAULT_ADDR)
+    ok = True
+    for t in ("bluetoothctl", "pactl", "pacat", "ffmpeg"):
+        found = shutil.which(t)
+        log(f"tool {t}: {'ok' if found else 'MISSING'}")
+        ok &= bool(found)
+    info = subprocess.run(["pactl", "info"], capture_output=True, text=True).stdout
+    server = next((l.split(":", 1)[1].strip() for l in info.splitlines() if l.startswith("Server Name")), "?")
+    rate = next((l.split(":", 1)[1].strip() for l in info.splitlines() if l.startswith("Default Sample")), "?")
+    log(f"audio server: {server}  default spec: {rate}")
+    mods = subprocess.run(["pactl", "list", "short", "modules"], capture_output=True, text=True).stdout
+    if "pulseaudio" in server.lower():
+        has = "module-bluez5-discover" in mods
+        log(f"PulseAudio bluez5 module: {'loaded' if has else 'MISSING (apt install pulseaudio-module-bluetooth)'}")
+        ok &= has
+        if "44100" not in rate:
+            log("WARNING: PulseAudio default-sample-rate is not 44100 — set it in /etc/pulse/daemon.conf")
+    bt = subprocess.run(["bluetoothctl", "info", mac], capture_output=True, text=True).stdout
+    paired = "Paired: yes" in bt
+    log(f"classic {mac}: paired={paired} trusted={'Trusted: yes' in bt} "
+        f"a2dp_uuid={'0000110b' in bt} connected={'Connected: yes' in bt}")
+    if not paired:
+        log("NOTE: no bond yet — first live run will pair (agent answers PIN 1234)")
+    log(f"PREFLIGHT {'OK ✅' if ok else 'FAILED ❌'}")
+    return ok
+
+
 def main():
     p = argparse.ArgumentParser(description="12ft Skelly Pi Orchestrator")
     p.add_argument("audio", nargs="?", default=None, help="Audio file (wav/mp3)")
     p.add_argument("--mode", choices=["live", "upload", "hybrid"], default="live",
                    help="live=A2DP stream; upload=C0-C6 onboard playback; hybrid=live, fall back to upload after 2 failed handshakes")
     p.add_argument("--test-head", type=float, metavar="SECONDS", help="Head motion test only")
+    p.add_argument("--preflight", action="store_true", help="Local checks only; no radio traffic to the skull")
     p.add_argument("--capacity", action="store_true", help="Query device storage capacity (0xD2) + raw 0xE0")
     p.add_argument("--classic-addr", default=None, help=f"Classic BT MAC (default {CLASSIC_DEFAULT_ADDR})")
     p.add_argument("--no-head", action="store_true", help="Skip 0xCA head start/stop during live playback")
+    p.add_argument("--repair", action="store_true",
+                   help="Remove + re-pair the classic Live device (default: reuse existing bond)")
     p.add_argument("--volume", type=int, default=80, help="FA volume 0-100 (default 80)")
     a = p.parse_args()
 
+    if a.preflight:
+        sys.exit(0 if run_preflight(a.classic_addr) else 1)
     if a.capacity:
         sys.exit(0 if asyncio.run(run_capacity()) else 1)
     if a.test_head is not None:
@@ -865,7 +995,7 @@ def main():
         log(f"FATAL: audio file not found: {path}")
         sys.exit(1)
     log(f"=== SKELLY SESSION mode={a.mode} ===")
-    ok = asyncio.run(run_session(a.mode, path, a.classic_addr, not a.no_head, a.volume))
+    ok = asyncio.run(run_session(a.mode, path, a.classic_addr, not a.no_head, a.volume, a.repair))
     sys.exit(0 if ok else 1)
 
 
