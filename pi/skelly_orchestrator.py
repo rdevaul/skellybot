@@ -82,6 +82,8 @@ MAX_CUSTOM_FILES = 25   # recycle before firmware corrupts near 30
 
 # Hybrid mode: max classic BT failure attempts before upload fallback
 HYBRID_MAX_LIVE_FAILS = 2
+GAIN_DB = float(os.environ.get("SKELLY_GAIN_DB", "4"))  # extra post-loudnorm gain (limited)
+BLE_ABORT_RETRIES = 3     # only for HCI 0x3e link-setup failures (no traffic reached skull)
 
 
 def log(msg: str) -> None:
@@ -209,15 +211,28 @@ async def ble_connect_auth():
         await scanner.stop()
         return None, None
     ble_addr = held[-1].address
-    log(f"connecting to BLE {ble_addr} (discovery held open)...")
-    try:
-        client = BleakClient(held[-1], timeout=30.0)
-        await client.connect()
-    except Exception as e:
-        log(f"BLE connect FAILED: {e}")
-        log("ADVICE: power-cycle the Skelly and try again. Do NOT retry — stacked retries cause chirping.")
-        await scanner.stop()
-        return None, None
+    client = None
+    for attempt in range(1, BLE_ABORT_RETRIES + 1):
+        log(f"connecting to BLE {ble_addr} (discovery held open, try {attempt}/{BLE_ABORT_RETRIES})...")
+        try:
+            client = BleakClient(held[-1], timeout=30.0)
+            await client.connect()
+            break
+        except Exception as e:
+            client = None
+            msg = str(e)
+            # HCI 0x3e "Connection Failed to be Established" surfaces from BlueZ as
+            # "Software caused connection abort": the link never came up (no packet
+            # exchanged with the skull), so a short bounded retry is safe. Any other
+            # error (timeouts = firmware latch) → stop, power-cycle.
+            if "connection abort" in msg.lower() and attempt < BLE_ABORT_RETRIES:
+                log(f"BLE link setup failed (HCI 0x3e): {msg} — retrying in 1.5s")
+                await asyncio.sleep(1.5)
+                continue
+            log(f"BLE connect FAILED: {msg}")
+            log("ADVICE: power-cycle the Skelly and try again. Do NOT stack retries.")
+            await scanner.stop()
+            return None, None
     log("BLE connected ✅")
 
     rx_queue: asyncio.Queue = asyncio.Queue()
@@ -490,6 +505,20 @@ def find_pipewire_bt_sink(mac: str | None = None) -> str | None:
     return None
 
 
+def max_sink_volume(sink: str) -> None:
+    """Force the BT sink to 100% and log what PulseAudio/PipeWire reports.
+    On BlueZ this may also drive AVRCP absolute volume on the skull."""
+    subprocess.run(["pactl", "set-sink-mute", sink, "0"], capture_output=True, timeout=5)
+    subprocess.run(["pactl", "set-sink-volume", sink, "100%"], capture_output=True, timeout=5)
+    out = subprocess.run(["pactl", "list", "sinks"], capture_output=True, text=True, timeout=5).stdout
+    cur = None
+    for line in out.splitlines():
+        if line.strip().startswith("Name:"):
+            cur = line.split("Name:")[1].strip()
+        if cur == sink and line.strip().startswith("Volume:"):
+            log(f"BT sink volume: {line.strip()}")
+
+
 def wait_for_bt_sink(mac: str, timeout: float = 12.0) -> str | None:
     """Poll for the A2DP sink; on PulseAudio, nudge the card into a2dp_sink."""
     end = time.time() + timeout
@@ -545,7 +574,7 @@ def stream_audio_pipewire(audio_path: str, timeout: float = 120.0, sink: str | N
         log("streaming via pacat (ffmpeg → s16le 44100 stereo)")
         ff = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-i", audio_path,
-             "-af", "loudnorm=I=-10:TP=-1:LRA=11,apad=pad_dur=0.75",
+             "-af", f"loudnorm=I=-10:TP=-1:LRA=11,volume={GAIN_DB}dB,alimiter=limit=0.97,apad=pad_dur=0.75",
              "-f", "s16le", "-ar", "44100", "-ac", "2", "-"],
             stdout=subprocess.PIPE)
         pa_cmd = ["pacat", "--playback", "--format=s16le", "--rate=44100", "--channels=2"]
@@ -870,6 +899,7 @@ async def live_session(client, rx, audio_path: str, classic_addr: str,
         await tx(client, ENABLE_LIVE, bytes([0x00]), "FD 00 (abort live)")
         return False
     log(f"A2DP sink ready: {sink}")
+    max_sink_volume(sink)
 
     if head_motion:
         await head_start(client)                                  # 0xCA alongside FC 01
@@ -881,6 +911,7 @@ async def live_session(client, rx, audio_path: str, classic_addr: str,
     await enter_live_animation(client, rx)                        # (f) FC 01 while audio flows
     await asyncio.sleep(0.08)
     await apply_volume(client, rx, volume)                        # (g) volume after FC 01 (OpenSkelly order)
+    await tx(client, 0xE5, b"", "QUERY_VOLUME E5 (verify FA)", rx)
     audio_ok = await stream_task
 
     if head_motion:
@@ -978,7 +1009,7 @@ def main():
     p.add_argument("--no-head", action="store_true", help="Skip 0xCA head start/stop during live playback")
     p.add_argument("--repair", action="store_true",
                    help="Remove + re-pair the classic Live device (default: reuse existing bond)")
-    p.add_argument("--volume", type=int, default=80, help="FA volume 0-100 (default 80)")
+    p.add_argument("--volume", type=int, default=100, help="FA volume 0-100 (default 100, as OpenSkelly)")
     a = p.parse_args()
 
     if a.preflight:

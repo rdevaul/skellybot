@@ -76,6 +76,20 @@ the A2DP sink is `bluez_sink.<MAC>.a2dp_sink` on PulseAudio and
 Run `--preflight` first; it checks tools, audio server, bluez module and bond
 state without sending anything to the skull.
 
+### First end-to-end live audio: 2026-10-31 08:59 ✅
+
+Skull speaker played the clip with jaw lip-sync and head motion. Notes:
+- BLE connect often fails first with HCI `0x3e` (*Connection Failed to be
+  Established*), which BlueZ reports as "Software caused connection abort".
+  No packets reach the skull, so up to 3 retries are allowed **for that error
+  only**. If all 3 fail, wait ~30s before running again. That worked at 09:02;
+  don't power-cycle first.
+- Loudness: `FA` gets no ACK, but `E5` QUERY_VOLUME confirms it (`bb e5 64` =
+  100). The orchestrator now defaults to `FA 100`, forces the BT sink to 100%,
+  and applies loudnorm(-10 LUFS) + `SKELLY_GAIN_DB` (default +4 dB) with a limiter.
+- `C6` stop and `FC 00` get no ACK (harmless). `FC 01` replies with a
+  `fe dc ba …` status frame rather than `bb fc`.
+
 ### Bond reuse (do NOT re-pair every session)
 
 The classic `12ft Skelly(Live)` device only needs to be paired **once**
