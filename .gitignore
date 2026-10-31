@@ -50,3 +50,6 @@ Thumbs.db
 *.log
 captures/
 parler-venv/
+camera/watch_log.jsonl
+camera/dryrun_last.wav
+camera/frame_*.jpg
