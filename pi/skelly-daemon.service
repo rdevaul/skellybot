@@ -1,16 +1,20 @@
 [Unit]
-Description=12ft Skelly Persistent BT Daemon
-After=pulseaudio.service bluetooth.target
+Description=12ft Skelly Persistent BT Daemon (holds BLE + A2DP open, socket /tmp/skelly.sock)
+After=pulseaudio.service
 Wants=pulseaudio.service
+# Back off if the skull is off/latched: at most 6 starts per 10 min.
+StartLimitIntervalSec=600
+StartLimitBurst=6
 
 [Service]
 Type=simple
-ExecStart=/home/rich/skelly-venv/bin/python /home/rich/skelly_daemon.py
+WorkingDirectory=/home/rich
+Environment=SKELLY_SOCKET=/tmp/skelly.sock PYTHONUNBUFFERED=1
+ExecStart=/home/rich/skelly-venv/bin/python -W ignore /home/rich/skelly_daemon.py
 Restart=on-failure
-RestartSec=20
-Environment=SKELLY_SOCKET=/tmp/skelly.sock
-# Don't kill the daemon when the user logs out
-# (ensure `loginctl enable-linger rich` is set)
+RestartSec=30
+StandardOutput=append:/tmp/skelly_daemon.log
+StandardError=append:/tmp/skelly_daemon.log
 
 [Install]
 WantedBy=default.target

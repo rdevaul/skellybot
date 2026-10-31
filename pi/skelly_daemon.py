@@ -241,6 +241,7 @@ def pre_render_clip(
     preroll_s: float = DAEMON_PREROLL_S,
     gain_db: float = orc.GAIN_DB,
     noise_amplitude: float = NOISE_AMPLITUDE,
+    prenorm: bool = False,
 ) -> str:
     """Pre-render an audio clip for playback through the BT sink.
 
@@ -255,7 +256,8 @@ def pre_render_clip(
          f"anoisesrc=color=pink:amplitude={noise_amplitude}:duration={preroll_s}:sample_rate=44100",
          "-filter_complex",
          f"[0:a]aresample=44100,aformat=channel_layouts=stereo,"
-         f"loudnorm=I=-10:TP=-1:LRA=11,volume={gain_db}dB,alimiter=limit=0.97,apad=pad_dur=0.25[sp];"
+         + ("apad=pad_dur=0.25[sp];" if prenorm else
+            f"loudnorm=I=-10:TP=-1:LRA=11,volume={gain_db}dB,alimiter=limit=0.97,apad=pad_dur=0.25[sp];") +
          f"[1:a]aformat=channel_layouts=stereo[pr];[pr][sp]concat=n=2:v=0:a=1[out]",
          "-map", "[out]",
          "-f", "s16le", "-ar", "44100", "-ac", "2", raw],
@@ -268,7 +270,7 @@ def pre_render_clip(
 
 async def play_clip(
     client, rx, sink: str, audio_path: str,
-    head_motion: bool = True, volume: int = 100,
+    head_motion: bool = True, volume: int = 100, prenorm: bool = False,
 ) -> dict:
     """Play one audio clip: pre-render, pause bed, head START, pacat, FC 01 + FA, head STOP.
 
@@ -280,7 +282,7 @@ async def play_clip(
     # Pre-render
     t0 = time.time()
     with tempfile.TemporaryDirectory(prefix="skelly-clip-") as td:
-        raw = pre_render_clip(audio_path, td)
+        raw = pre_render_clip(audio_path, td, prenorm=prenorm)
         render_s = time.time() - t0
         size_bytes = os.path.getsize(raw)
         orc.log(f"daemon: pre-rendered {size_bytes / 176400:.2f}s in {render_s:.2f}s")
@@ -296,27 +298,28 @@ async def play_clip(
             "pacat", "--playback", "--format=s16le", "--rate=44100", "--channels=2",
             f"--latency-msec={orc.PACAT_LATENCY_MS}", f"--device={sink}", raw,
         ]
-        orc.log(f"daemon: streaming clip via pacat …")
+        orc.log("daemon: streaming clip via pacat …")
         t_stream = time.time()
         loop = asyncio.get_running_loop()
-        pa_result = await loop.run_in_executor(None, subprocess.run, pa_cmd)
-        stream_s = time.time() - t_stream
-        timings["duration_s"] = round(stream_s, 3)
+        pa_fut = loop.run_in_executor(None, subprocess.run, pa_cmd)
         timings["start_latency_s"] = round(t_stream - t0, 3)
-
-        # After pacat starts, send FC 01 + FA (same timing as orchestrator live_session)
-        # Note: we send these AFTER the stream has started, not before.
+        # FC 01 + FA while audio is flowing (same order as the verified one-shot path)
+        await asyncio.sleep(0.3)
         orc.drain(rx)
         await orc.enter_live_animation(client, rx)
         await asyncio.sleep(0.08)
         await orc.apply_volume(client, rx, volume)
+        pa_result = await pa_fut
+        timings["duration_s"] = round(time.time() - t_stream, 3)
+        if pa_result.returncode != 0:
+            raise RuntimeError(f"pacat exited {pa_result.returncode}")
 
     # Stop head motion
     if head_motion:
         await orc.head_stop(client)
 
     # Exit live animation
-    await orc.tx(client, orc.ENTER_LIVE_ANIM, bytes([0x00]), "daemon FC 00 (post-clip)", rx)
+    await orc.tx(client, orc.ENTER_LIVE_ANIM, bytes([0x00]), "daemon FC 00 (post-clip)")
 
     timings["total_s"] = round(time.time() - t_start, 3)
     return timings
@@ -361,6 +364,8 @@ async def handle_client_request(
         return {"ok": True, "message": "stop requested (current clip will finish)"}
 
     if cmd == "shutdown":
+        # Same path as SIGTERM: main loop is waiting on the signal handler.
+        asyncio.get_running_loop().call_later(0.2, os.kill, os.getpid(), signal.SIGTERM)
         return {"ok": True, "message": "shutdown requested"}
 
     if cmd == "play":
@@ -370,7 +375,7 @@ async def handle_client_request(
 
         # Queue the request
         result_holder: list = []
-        await queue.put((path, req.get("head", True), result_holder))
+        await queue.put((path, (req.get("head", True), bool(req.get("prenorm", False))), result_holder))
 
         # Wait for it to complete (FIFO ensures no overlap)
         while not result_holder:
@@ -381,12 +386,16 @@ async def handle_client_request(
 
 
 async def socket_server(
-    client, rx, sink: str, state: DaemonState,
+    client_holder: list, rx_holder: list, sink_holder: list, state: DaemonState,
     classic_addr: str, head_motion: bool, volume: int,
     ka_stop_event: asyncio.Event | None,
     bed_proc_holder: list,
 ) -> asyncio.Server:
-    """Listen on the UNIX socket; dispatch requests."""
+    """Listen on the UNIX socket; dispatch requests.
+
+    Uses the mutable holders (not captured objects) so requests after a
+    supervisor reconnect go to the *new* BLE client / sink.
+    """
 
     # FIFO queue for play requests
     play_queue: asyncio.Queue = asyncio.Queue()
@@ -394,12 +403,18 @@ async def socket_server(
     # Background worker: drain the queue and play clips one at a time
     async def queue_worker():
         while True:
-            path, do_head, result_holder = await play_queue.get()
+            path, opts, result_holder = await play_queue.get()
+            do_head, prenorm = opts if isinstance(opts, tuple) else (opts, False)
             if state.state in ("SHUTTING_DOWN", "FAILED"):
                 result_holder.append({"ok": False, "error": "daemon not ready"})
                 play_queue.task_done()
                 continue
 
+            if state.state != "READY":
+                result_holder.append({"ok": False, "error": f"daemon state {state.state}"})
+                play_queue.task_done()
+                continue
+            client, rx, sink = client_holder[0], rx_holder[0], sink_holder[0]
             state.set("PLAYING")
             state.now_playing = os.path.basename(path)
             orc.log(f"daemon: playing {path} …")
@@ -414,7 +429,7 @@ async def socket_server(
                         bed_proc_holder[0].kill()
                     bed_proc_holder[0] = None
 
-                timings = await play_clip(client, rx, sink, path, do_head, volume)
+                timings = await play_clip(client, rx, sink, path, do_head, volume, prenorm)
 
                 # Get link stats
                 link_stats: dict = {}
@@ -439,7 +454,8 @@ async def socket_server(
                     state.set("READY")
 
                 # Resume the idle noise bed
-                if bed_proc_holder[0] is None and sink:
+                sink = sink_holder[0]
+                if bed_proc_holder[0] is None and sink and state.state == "READY":
                     try:
                         bed_proc_holder[0] = start_noise_bed(sink)
                     except Exception as e:
@@ -459,7 +475,7 @@ async def socket_server(
                 return
 
             resp = await handle_client_request(
-                line, client, rx, sink, state, play_queue,
+                line, client_holder[0], rx_holder[0], sink_holder[0], state, play_queue,
                 bed_proc_holder, classic_addr, head_motion, volume, ka_stop_event,
             )
             writer.write((json.dumps(resp) + "\n").encode())
@@ -481,23 +497,21 @@ async def socket_server(
 
 # ── Health check + recovery ─────────────────────────────────────────────────
 
-async def health_check_ble(client) -> bool:
-    """Cheap BLE health: send E5 QUERY_VOLUME, expect BB E5 xx."""
+async def health_check_ble(client, rx) -> bool:
+    """Cheap BLE health: send E5 QUERY_VOLUME on the persistent notify queue, expect BB E5 xx."""
     try:
-        # Create a temporary notify to read the response
-        rx_queue: asyncio.Queue = asyncio.Queue()
-        await client.start_notify(orc.NOTIFY_UUID, lambda _, d: rx_queue.put_nowait(bytes(d)))
-        await asyncio.sleep(0.1)
-        await orc.tx(client, 0xE5, b"", "health E5", rx_queue)
-        await client.stop_notify(orc.NOTIFY_UUID)
-        # tx already logs the reply; check if we got a BB E5 reply
-        # We need to peek the queue for a reply
-        try:
-            reply = await asyncio.wait_for(rx_queue.get(), timeout=2.0)
+        if not getattr(client, "is_connected", True):
+            return False
+        orc.drain(rx)
+        await client.write_gatt_char(orc.WRITE_UUID, orc.build_packet(0xE5), response=False)
+        end = time.time() + 3.0
+        while time.time() < end:
+            try:
+                reply = await asyncio.wait_for(rx.get(), timeout=max(0.05, end - time.time()))
+            except asyncio.TimeoutError:
+                break
             if len(reply) >= 2 and reply[0] == orc.ACK_PREFIX and reply[1] == 0xE5:
                 return True
-        except asyncio.TimeoutError:
-            pass
         return False
     except Exception:
         return False
@@ -607,7 +621,7 @@ async def supervisor_loop(
             continue
 
         # E5 health check
-        e5_ok = await health_check_ble(client)
+        e5_ok = await health_check_ble(client, rx_holder[0])
         if not e5_ok:
             orc.log("supervisor: E5 health check failed — triggering full reconnect")
             state.set("RECOVERING", "BLE E5 health check failed")
@@ -662,6 +676,16 @@ async def _do_reconnect(
             return
 
         try:
+            old_bed = bed_proc_holder[0]
+            if old_bed is not None and old_bed.poll() is None:
+                old_bed.terminate()
+            bed_proc_holder[0] = None
+            if full and client_holder[0] is not None:
+                try:
+                    await client_holder[0].disconnect()
+                except Exception:
+                    pass
+                client_holder[0] = None
             if full:
                 result = await attempt_full_reconnect(
                     classic_addr, volume, fd01_keepalive,
@@ -753,7 +777,7 @@ async def daemon_main(
     # Start socket server
     try:
         server = await socket_server(
-            client, rx, sink, state, classic_addr, head_motion, volume,
+            client_holder, rx_holder, sink_holder, state, classic_addr, head_motion, volume,
             ka_stop_event, bed_proc_holder,
         )
         server_holder[0] = server

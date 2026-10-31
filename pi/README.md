@@ -113,6 +113,20 @@ Rich heard the start of the clip lag and clip. The stream now opens with
 `SKELLY_PREROLL_S` (default 0.6s) of faint pink noise (~-60 dBFS), not digital
 silence, so the skull's amp is already unmuted when speech starts.
 
+### Persistent daemon results (2026-10-31 09:45)
+
+- Installed as `systemctl --user` unit `skelly-daemon` (linger on, so it starts at boot
+  without anyone logged in). `StartLimitBurst=6/600s` plus `RestartSec=30` keep a
+  powered-off skull from being hammered with BLE connects.
+- Per-line start latency went from ~25s to **0.48s** (`--prenorm`: Spark normalizes
+  the audio, Pi just adds pre-roll). Ming "Now I am always listening…": 3s TTS, 0.5s
+  to first sound, 18s wall clock for an 8s clip, the rest being SSH/scp overhead.
+- Review fixes applied on top of the generated daemon: FC 01/FA now go out *during*
+  playback; the E5 health check uses the persistent notify queue (start/stop_notify
+  would have killed the main callback); request handlers use the reconnect holders
+  (not stale captured client/sink); the old BLE client and noise bed are torn down
+  before reconnecting; `shutdown` actually stops the daemon.
+
 ### Bond reuse (do NOT re-pair every session)
 
 The classic `12ft Skelly(Live)` device only needs to be paired **once**

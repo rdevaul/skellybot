@@ -31,6 +31,7 @@ DEFAULT_PROMPT = ("Please generate speech with a deep, low-pitched male voice "
                   "with a dry, sardonic delivery.\n")
 DEFAULT_TEMPO = float(os.environ.get("MING_TEMPO", "0.65"))
 MAX_TEXT = 600
+GAIN_DB = float(os.environ.get("MING_GAIN_DB", "4"))
 
 sys.path.insert(0, SRC)
 sys.path.insert(0, os.path.join(SRC, "cookbooks"))
@@ -67,9 +68,12 @@ def main():
                     prompt_wav_path=None, prompt_text=None, instruction=None,
                     max_decode_steps=steps, output_wav_path=raw)
             gen = time.time() - t
-            af = f"atempo={tempo}" if abs(tempo - 1.0) > 1e-3 else "anull"
+            af = f"atempo={tempo}," if abs(tempo - 1.0) > 1e-3 else ""
+            # Loudness-normalize here (Spark CPU is ~20x the Pi's), so the Pi
+            # daemon can skip loudnorm (--prenorm). Same chain as the Pi path.
+            af += f"loudnorm=I=-10:TP=-1:LRA=11,volume={GAIN_DB}dB,alimiter=limit=0.97"
             subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", raw, "-af", af,
-                            "-ar", "44100", "-ac", "1", out], check=True, timeout=60)
+                            "-ar", "44100", "-ac", "2", out], check=True, timeout=60)
             data = open(out, "rb").read()
             log(f"synth {len(text)} chars -> {len(data)} B in {gen:.2f}s (tempo {tempo})")
             return data

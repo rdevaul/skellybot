@@ -22,7 +22,7 @@ if ssh -i "$KEY" -o ConnectTimeout=5 "$PI" 'test -S /tmp/skelly.sock' 2>/dev/nul
   scp -q -i "$KEY" "$TMP" "$PI:/tmp/$NAME"
   rm -f "$TMP"
   RESP=$(ssh -i "$KEY" -o ConnectTimeout=5 "$PI" \
-    "~/skelly-venv/bin/python ~/skelly_client.py play /tmp/$NAME 2>&1")
+    "~/skelly-venv/bin/python ~/skelly_client.py play --prenorm /tmp/$NAME 2>&1")
   echo "$RESP"
   ssh -i "$KEY" "$PI" "rm -f /tmp/$NAME"
   # Check for ok=false in response

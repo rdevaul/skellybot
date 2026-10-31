@@ -1,0 +1,19 @@
+[Unit]
+Description=Ming TTS server for Skelly (UNIX socket ~/ming.sock, no TCP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rich
+Group=rich
+WorkingDirectory=/home/rich/ming-tts-src
+Environment=MING_SOCK=/home/rich/ming.sock
+ExecStart=/home/rich/ming-venv/bin/python /home/rich/skelly-spark/ming_server.py
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:/home/rich/skelly-spark/ming_server.log
+StandardError=append:/home/rich/skelly-spark/ming_server.log
+
+[Install]
+WantedBy=multi-user.target

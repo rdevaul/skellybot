@@ -21,7 +21,7 @@ import tempfile
 SOCKET_PATH = os.environ.get("SKELLY_SOCKET", "/tmp/skelly.sock")
 
 
-async def send_request(cmd: str, path: str | None = None, head: bool = True) -> dict:
+async def send_request(cmd: str, path: str | None = None, head: bool = True, prenorm: bool = False) -> dict:
     """Connect to the daemon socket, send one JSON request, return the reply."""
     if not os.path.exists(SOCKET_PATH):
         return {"ok": False, "error": f"socket not found: {SOCKET_PATH} (is the daemon running?)"}
@@ -30,13 +30,14 @@ async def send_request(cmd: str, path: str | None = None, head: bool = True) -> 
     if cmd == "play":
         req["path"] = path
         req["head"] = head
+        req["prenorm"] = prenorm
 
     reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
     try:
         writer.write((json.dumps(req) + "\n").encode())
         await writer.drain()
 
-        data = await asyncio.wait_for(reader.read(4096), timeout=60.0 if cmd == "play" else 5.0)
+        data = await asyncio.wait_for(reader.read(4096), timeout=240.0 if cmd == "play" else 5.0)
         reply = data.decode().strip()
         return json.loads(reply) if reply else {"ok": False, "error": "empty reply"}
     finally:
@@ -47,14 +48,14 @@ async def send_request(cmd: str, path: str | None = None, head: bool = True) -> 
             pass
 
 
-async def play_file(audio_path: str, head: bool = True) -> int:
+async def play_file(audio_path: str, head: bool = True, prenorm: bool = False) -> int:
     """Play a file: if remote (scp needed), copy first, then request play."""
     abs_path = os.path.abspath(audio_path)
     if not os.path.exists(abs_path):
         print(json.dumps({"ok": False, "error": f"file not found: {abs_path}"}))
         return 1
 
-    resp = await send_request("play", abs_path, head)
+    resp = await send_request("play", abs_path, head, prenorm)
     print(json.dumps(resp, indent=2))
     return 0 if resp.get("ok") else 1
 
@@ -84,6 +85,8 @@ def main():
     p_play = sub.add_parser("play", help="Play an audio file")
     p_play.add_argument("file", help="Path to audio file")
     p_play.add_argument("--no-head", action="store_true", help="Skip head motion")
+    p_play.add_argument("--prenorm", action="store_true",
+                        help="Audio is already loudness-normalized 44.1k (skip Pi-side loudnorm)")
 
     sub.add_parser("status", help="Get daemon status")
     sub.add_parser("stop", help="Stop current playback")
@@ -92,7 +95,7 @@ def main():
     a = p.parse_args()
 
     if a.command == "play":
-        sys.exit(asyncio.run(play_file(a.file, head=not a.no_head)))
+        sys.exit(asyncio.run(play_file(a.file, head=not a.no_head, prenorm=a.prenorm)))
     elif a.command == "status":
         sys.exit(asyncio.run(status()))
     elif a.command == "stop":
