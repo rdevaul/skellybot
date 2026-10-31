@@ -83,6 +83,7 @@ MAX_CUSTOM_FILES = 25   # recycle before firmware corrupts near 30
 # Hybrid mode: max classic BT failure attempts before upload fallback
 HYBRID_MAX_LIVE_FAILS = 2
 GAIN_DB = float(os.environ.get("SKELLY_GAIN_DB", "4"))  # extra post-loudnorm gain (limited)
+PREROLL_S = float(os.environ.get("SKELLY_PREROLL_S", "0.6"))
 PACAT_LATENCY_MS = int(os.environ.get("SKELLY_LATENCY_MS", "300"))
 BLE_ABORT_RETRIES = 3     # only for HCI 0x3e link-setup failures (no traffic reached skull)
 
@@ -621,7 +622,16 @@ def stream_audio_pipewire(audio_path: str, timeout: float = 120.0, sink: str | N
         t0 = time.time()
         subprocess.run(
             ["ffmpeg", "-v", "error", "-y", "-i", audio_path,
-             "-af", f"loudnorm=I=-10:TP=-1:LRA=11,volume={GAIN_DB}dB,alimiter=limit=0.97,apad=pad_dur=0.75",
+             # Pre-roll: the skull mutes its amp during silence and clips the first
+             # moment of sound when it unmutes (SkellyUltra v1.6.3). Prepend
+             # PREROLL_S of faint pink noise (~-60 dBFS) — not digital silence —
+             # so the amp is awake before speech starts.
+             "-f", "lavfi", "-i", f"anoisesrc=color=pink:amplitude=0.001:duration={PREROLL_S}:sample_rate=44100",
+             "-filter_complex",
+             f"[0:a]aresample=44100,aformat=channel_layouts=stereo,"
+             f"loudnorm=I=-10:TP=-1:LRA=11,volume={GAIN_DB}dB,alimiter=limit=0.97,apad=pad_dur=0.75[sp];"
+             f"[1:a]aformat=channel_layouts=stereo[pr];[pr][sp]concat=n=2:v=0:a=1[out]",
+             "-map", "[out]",
              "-f", "s16le", "-ar", "44100", "-ac", "2", raw], check=True, timeout=120)
         log(f"pre-rendered {os.path.getsize(raw)/176400:.1f}s of audio in {time.time()-t0:.1f}s")
         pa_cmd = ["pacat", "--playback", "--format=s16le", "--rate=44100", "--channels=2",
@@ -722,7 +732,8 @@ async def head_stop(client: BleakClient):
 async def stop_onboard_playback(client, rx):
     """(a) Stop onboard-file playback via C6. TODO-verify payload: we send
     PLAY_FILE with serial 0x0000 and action 0x00 (play uses action 0x01)."""
-    await tx(client, PLAY_FILE, bytes([0x00, 0x00, 0x00]), "(a) stop playback C6 [TODO-verify payload]", rx)
+    await tx(client, PLAY_FILE, bytes([0x00, 0x00, 0x00]), "(a) stop playback C6 (no ACK expected)")
+    await asyncio.sleep(0.12)
     drain(rx)
 
 
@@ -739,7 +750,8 @@ async def enter_live_animation(client, rx):
 async def apply_volume(client, rx, volume: int):
     """(g) FA — SET_VOLUME (opcode from skelly.py Cmd.SET_VOLUME). Range assumed 0-100 [TODO-verify]."""
     v = max(0, min(100, int(volume)))
-    await tx(client, SET_VOLUME, bytes([v]), f"(g) volume FA {v}", rx)
+    await tx(client, SET_VOLUME, bytes([v]), f"(g) volume FA {v} (no ACK expected; verified via E5)")
+    await asyncio.sleep(0.12)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -913,7 +925,8 @@ async def live_session(client, rx, audio_path: str, classic_addr: str,
     """
     log("PATH: LIVE (A2DP)")
     await stop_onboard_playback(client, rx)                       # (a)
-    await tx(client, ENTER_LIVE_ANIM, bytes([0x00]), "(a) FC 00 (reset live anim)", rx)
+    await tx(client, ENTER_LIVE_ANIM, bytes([0x00]), "(a) FC 00 (reset live anim, no ACK expected)")
+    await asyncio.sleep(0.12)
 
     keepalive = LiveKeepalive(client)
     classic_ok = False

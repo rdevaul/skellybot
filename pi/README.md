@@ -107,6 +107,12 @@ Skull speaker played the clip with jaw lip-sync and head motion. Notes:
 - SkellyUltra also notes cold-start clipping: the skull mutes during silence.
   Fix is a short faint-noise pre-roll.
 
+### Pre-roll
+
+Rich heard the start of the clip lag and clip. The stream now opens with
+`SKELLY_PREROLL_S` (default 0.6s) of faint pink noise (~-60 dBFS), not digital
+silence, so the skull's amp is already unmuted when speech starts.
+
 ### Bond reuse (do NOT re-pair every session)
 
 The classic `12ft Skelly(Live)` device only needs to be paired **once**
