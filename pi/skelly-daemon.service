@@ -1,0 +1,16 @@
+[Unit]
+Description=12ft Skelly Persistent BT Daemon
+After=pulseaudio.service bluetooth.target
+Wants=pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=/home/rich/skelly-venv/bin/python /home/rich/skelly_daemon.py
+Restart=on-failure
+RestartSec=20
+Environment=SKELLY_SOCKET=/tmp/skelly.sock
+# Don't kill the daemon when the user logs out
+# (ensure `loginctl enable-linger rich` is set)
+
+[Install]
+WantedBy=default.target

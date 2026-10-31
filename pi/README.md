@@ -276,6 +276,100 @@ No audio, no A2DP pairing. Good for verifying BLE link and movement.
 Polynomial 0x1D (reversed 0x8C), init 0. Computed over `[AA, cmd, payload_padded]`.
 Verified against existing Mac reference code (`skelly.py`). Flag: needs on-hardware verification against a captured ACK packet.
 
+## Persistent Daemon
+
+The one-shot orchestrator costs ~25 s of setup (BLE scan/auth + classic connect) per
+utterance. The **persistent daemon** keeps BLE + A2DP alive between clips so each
+utterance starts in ~1-2 s.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    skelly_daemon.py                       │
+│                                                           │
+│  Startup:  BLE connect → auth → FD 01 → classic → FE 01  │
+│            → wait sink → volume 100% → FA 100            │
+│                                                           │
+│  Idle:     faint pink-noise bed (~-60 dBFS) via pacat     │
+│            → keeps skull amp awake (no sleep between clips)│
+│            E5 QUERY_VOLUME health check every 15s         │
+│                                                           │
+│  Play:     UNIX socket → queue → pre-render → pacat clip  │
+│            → FC 01 + FA → head start/stop → resume bed    │
+│                                                           │
+│  Recovery: exponential backoff (2,4,8,16,30s cap)        │
+│            classic-only drop → FD 01 + btctl connect      │
+│            BLE drop → full reconnect                      │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Running
+
+```bash
+# Foreground (testing):
+~/skelly-venv/bin/python ~/skelly_daemon.py
+
+# Via systemd --user (recommended):
+cp skelly-daemon.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now skelly-daemon
+loginctl enable-linger rich  # survive logout
+```
+
+### Client
+
+```bash
+# On the Pi:
+~/skelly-venv/bin/python ~/skelly_client.py play /tmp/say_12345.wav
+~/skelly-venv/bin/python ~/skelly_client.py status
+~/skelly-venv/bin/python ~/skelly_client.py stop
+~/skelly-venv/bin/python ~/skelly_client.py shutdown
+```
+
+### Socket protocol
+
+UNIX socket at `/tmp/skelly.sock` (mode 0600). One JSON line per request:
+
+| Request | Reply |
+|---------|-------|
+| `{"cmd":"play","path":"/abs/file.wav","head":true}` | `{"ok":true,"timing":{"render_s":0.5,...},"link":{...}}` |
+| `{"cmd":"status"}` | `{"state":"READY","uptime_s":3600,"reconnect_count":0,...}` |
+| `{"cmd":"stop"}` | `{"ok":true,"message":"stop requested"}` |
+| `{"cmd":"shutdown"}` | `{"ok":true,"message":"shutdown requested"}` |
+
+### Recovery behavior
+
+| Failure | Detection | Action |
+|---------|-----------|--------|
+| Classic BT disconnect | `bluetoothctl info` shows `Connected: no` | FD 01 over BLE + `bluetoothctl connect` (≤4 tries) + FE 01 |
+| BLE disconnect | bleak `is_connected` false / E5 health check fails | Full reconnect (BLE + auth + classic) |
+| Noise bed process dies | `bed_proc.poll()` returns non-None | Restart noise bed |
+| All reconnect attempts exhausted | Backoff schedule drained | State → FAILED, log last error |
+
+Backoff schedule: 2, 4, 8, 16, 30 s (cap). The daemon **never** tight-loops BLE
+connects — firmware latches if hammered. Max one full BLE connect attempt per
+backoff step.
+
+### State values
+
+| State | Meaning |
+|-------|---------|
+| `INIT` | Daemon starting |
+| `CONNECTING` | BLE + classic setup in progress |
+| `READY` | Links up, noise bed streaming, waiting for play requests |
+| `PLAYING` | Currently streaming a clip |
+| `RECOVERING` | Reconnection in progress (backoff active) |
+| `FAILED` | All reconnect attempts exhausted |
+| `SHUTTING_DOWN` | Graceful shutdown in progress |
+
+### skelly_say.sh fast path
+
+`skelly_say.sh` now checks for the daemon socket before falling back to the
+one-shot orchestrator. If `/tmp/skelly.sock` exists on the Pi, it SCPs the WAV
+and uses the client to play it (~1-2 s latency). Otherwise it falls back to the
+existing `skelly_orchestrator.py --mode live` command (~25 s).
+
 ## File Listing
 
 | File | Purpose |
@@ -283,6 +377,9 @@ Verified against existing Mac reference code (`skelly.py`). Flag: needs on-hardw
 | `setup.sh` | Idempotent Pi OS Bookworm setup |
 | `skelly_orchestrator.py` | Main orchestrator — full session or head test |
 | `skelly_bt_agent.py` | D-Bus Bluetooth agent for PIN pairing |
+| `skelly_daemon.py` | Persistent daemon — keeps BT links alive between clips |
+| `skelly_client.py` | CLI client for the daemon socket |
+| `skelly-daemon.service` | systemd --user unit template |
 | `README.md` | This file |
 
 ## Source / Reference
