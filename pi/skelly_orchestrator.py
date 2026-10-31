@@ -83,6 +83,7 @@ MAX_CUSTOM_FILES = 25   # recycle before firmware corrupts near 30
 # Hybrid mode: max classic BT failure attempts before upload fallback
 HYBRID_MAX_LIVE_FAILS = 2
 GAIN_DB = float(os.environ.get("SKELLY_GAIN_DB", "4"))  # extra post-loudnorm gain (limited)
+PACAT_LATENCY_MS = int(os.environ.get("SKELLY_LATENCY_MS", "300"))
 BLE_ABORT_RETRIES = 3     # only for HCI 0x3e link-setup failures (no traffic reached skull)
 
 
@@ -233,7 +234,8 @@ async def ble_connect_auth():
             log("ADVICE: power-cycle the Skelly and try again. Do NOT stack retries.")
             await scanner.stop()
             return None, None
-    log("BLE connected ✅")
+    await scanner.stop()   # never leave LE discovery running during A2DP (BT/WiFi coex → dropouts)
+    log("BLE connected ✅ (discovery stopped)")
 
     rx_queue: asyncio.Queue = asyncio.Queue()
     await client.start_notify(NOTIFY_UUID, lambda _, d: rx_queue.put_nowait(bytes(d)))
@@ -556,6 +558,46 @@ def log_sink_rate(sink: str | None) -> None:
         pass
 
 
+class LinkMonitor:
+    """Sample classic-link RSSI / link quality once a second during streaming
+    (hcitool rssi/lq on the ACL handle) so dropouts can be attributed to RF."""
+
+    def __init__(self, mac: str, period: float = 1.0):
+        import threading
+        self.mac, self.period = mac, period
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self.samples: list[tuple[int | None, int | None]] = []
+
+    def _q(self, what: str) -> int | None:
+        try:
+            out = subprocess.run(["hcitool", what, self.mac], capture_output=True,
+                                 text=True, timeout=2).stdout
+            return int(out.strip().split(":")[-1])
+        except Exception:
+            return None
+
+    def _run(self):
+        while not self._stop.is_set():
+            self.samples.append((self._q("rssi"), self._q("lq")))
+            self._stop.wait(self.period)
+
+    def start(self):
+        self._t.start()
+
+    def stop(self):
+        self._stop.set()
+        self._t.join(timeout=3)
+        r = [x for x, _ in self.samples if x is not None]
+        q = [y for _, y in self.samples if y is not None]
+        if r:
+            log(f"classic link RSSI (rel. golden range): min {min(r)} max {max(r)} "
+                f"avg {sum(r)/len(r):.1f}  | LQ min {min(q) if q else '?'} avg "
+                f"{(sum(q)/len(q)) if q else 0:.0f}/255  ({len(r)} samples)")
+        else:
+            log("link monitor: no RSSI samples (hcitool unavailable?)")
+
+
 def stream_audio_pipewire(audio_path: str, timeout: float = 120.0, sink: str | None = None) -> bool:
     """Stream audio to the BT sink. Order: pacat (via ffmpeg decode) → pw-play → paplay.
 
@@ -569,29 +611,36 @@ def stream_audio_pipewire(audio_path: str, timeout: float = 120.0, sink: str | N
     log(f"using BT sink: {sink}")
     log_sink_rate(sink)
 
-    # (e) pacat: decode to raw s16le 44.1k stereo and pipe in
+    # (e) pre-render (loudnorm is CPU-heavy; never run it inline with the stream),
+    #     then pacat the raw file to the BT sink.
+    mac = sink.split(".")[1].replace("_", ":") if "." in sink else None
+    mon = LinkMonitor(mac) if mac else None
     try:
-        log("streaming via pacat (ffmpeg → s16le 44100 stereo)")
-        ff = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-i", audio_path,
+        td = tempfile.mkdtemp(prefix="skelly-")
+        raw = os.path.join(td, "speech.s16")
+        t0 = time.time()
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", audio_path,
              "-af", f"loudnorm=I=-10:TP=-1:LRA=11,volume={GAIN_DB}dB,alimiter=limit=0.97,apad=pad_dur=0.75",
-             "-f", "s16le", "-ar", "44100", "-ac", "2", "-"],
-            stdout=subprocess.PIPE)
-        pa_cmd = ["pacat", "--playback", "--format=s16le", "--rate=44100", "--channels=2"]
-        if sink:
-            pa_cmd.append(f"--device={sink}")
-        pa = subprocess.Popen(pa_cmd, stdin=ff.stdout)
-        ff.stdout.close()
-        try:
-            pa.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            log("WARNING: pacat timed out")
-            pa.kill(); ff.kill()
-            return False
+             "-f", "s16le", "-ar", "44100", "-ac", "2", raw], check=True, timeout=120)
+        log(f"pre-rendered {os.path.getsize(raw)/176400:.1f}s of audio in {time.time()-t0:.1f}s")
+        pa_cmd = ["pacat", "--playback", "--format=s16le", "--rate=44100", "--channels=2",
+                  f"--latency-msec={PACAT_LATENCY_MS}", f"--device={sink}", raw]
+        log(f"streaming via pacat (latency {PACAT_LATENCY_MS} ms)")
+        if mon:
+            mon.start()
+        pa = subprocess.run(pa_cmd, timeout=timeout)
+        if mon:
+            mon.stop()
         if pa.returncode == 0:
             log("audio playback complete (pacat) ✅")
             return True
         log(f"pacat exited {pa.returncode}; falling back")
+    except subprocess.TimeoutExpired:
+        log("WARNING: pacat timed out")
+        if mon:
+            mon.stop()
+        return False
     except FileNotFoundError:
         log("ffmpeg/pacat not found; falling back to pw-play")
 

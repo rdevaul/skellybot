@@ -90,6 +90,23 @@ Skull speaker played the clip with jaw lip-sync and head motion. Notes:
 - `C6` stop and `FC 00` get no ACK (harmless). `FC 01` replies with a
   `fe dc ba …` status frame rather than `bb fc`.
 
+### Dropouts / choppy audio (09:05 investigation)
+
+- Classic link RF looked clean during a 22s stream: `hcitool rssi` 0 the whole
+  time (inside the golden receive range), link quality 255/255. SBC negotiated
+  Joint Stereo, bitpool 2–53, 44.1k.
+- Software causes we fixed: BLE discovery used to stay **on** for the whole
+  session (now stopped right after connect; SkellyUltra v1.6.2 saw the same
+  dropouts from scanning during audio), and loudnorm used to run live in the
+  stream pipe (now pre-rendered to a file before streaming). pacat now uses a
+  300 ms buffer (`SKELLY_LATENCY_MS`).
+- Prime suspect if it still stutters: **Pi 4 Wi-Fi/BT coexistence.** The two
+  radios share one antenna, and the Pi is on 2.4 GHz ch 1 at −70 dBm with a
+  big retry count. Use ethernet, 5 GHz, or `sudo rfkill block wifi` while
+  testing.
+- SkellyUltra also notes cold-start clipping: the skull mutes during silence.
+  Fix is a short faint-noise pre-roll.
+
 ### Bond reuse (do NOT re-pair every session)
 
 The classic `12ft Skelly(Live)` device only needs to be paired **once**
