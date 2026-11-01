@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -63,15 +64,24 @@ Set skip=true (line empty) if no person is clearly visible, or if the person loo
 or someone not trick-or-treating (just passing or working)."""
 
 
+def _redact(s: str) -> str:
+    # Exceptions can carry the RTSP URL (with password) or request headers; never log secrets.
+    for k in ("TAPO_PASS", "OPENROUTER_API_KEY"):
+        v = os.environ.get(k)
+        if v:
+            s = s.replace(v, "<redacted>")
+    return s
+
+
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    print(_redact(f"[{time.strftime('%H:%M:%S')}] {msg}"), flush=True)
 
 
 def jlog(rec: dict) -> None:
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **rec}
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
+        f.write(_redact(json.dumps(rec)) + "\n")
 
 
 # ── ONVIF PullPoint (raw SOAP; zeep chokes on the Tapo's long-poll) ─────────
@@ -106,6 +116,7 @@ class PeopleWatcher(threading.Thread):
         self.present = False
         self.last_true = 0.0
         self.last_false = time.time()
+        self.addr: str | None = None   # live subscription, so main() can release it on exit
 
     SUB_LIFETIME_S = 300   # Tapo keeps subscription objects around; stay well under
 
@@ -144,9 +155,9 @@ class PeopleWatcher(threading.Thread):
     def run(self):
         backoff = 5
         while True:
-            addr = None
+            self.addr = addr = None
             try:
-                addr = self._subscribe()
+                self.addr = addr = self._subscribe()
                 backoff = 5
                 renewed = last_ok = time.time()
                 log(f"onvif: subscribed {addr}")
@@ -229,8 +240,18 @@ def ssh_base(host: str) -> list[str]:
 
 def grab_frame(password: str, out: str) -> None:
     url = f"rtsp://{CAM_USER}:{password}@{CAM}:554/stream1"
-    subprocess.run(["ffmpeg", "-v", "quiet", "-y", "-rtsp_transport", "tcp", "-i", url, "-frames:v", "1",
-                    "-vf", "scale=1600:-2", "-q:v", "4", out], check=True, timeout=15)
+    cmd = ["ffmpeg", "-v", "quiet", "-y", "-rtsp_transport", "tcp", "-i", url, "-frames:v", "1",
+           "-vf", "scale=1600:-2", "-q:v", "4", out]
+    # One retry: the Tapo occasionally refuses RTSP while its few stream slots are busy (e.g. app live view).
+    for attempt in (1, 2):
+        try:
+            subprocess.run(cmd, check=True, timeout=15)
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            err = type(e).__name__   # not repr(e): that embeds the URL with the password
+        if attempt == 1:
+            time.sleep(0.5)
+    raise RuntimeError(f"frame grab failed twice ({err})")
 
 
 def vision_line(jpg: str, recent: list[str], model: str) -> dict:
@@ -398,12 +419,17 @@ def main():
         sys.exit("TAPO_PASS not set")
     if not a.dry_run and not daemon_ready():
         log("WARNING: skelly-daemon not READY on the Pi — lines will fail until it is")
-    PeopleWatcher(pw, h.trigger, a.min_gap).start()
+    w = PeopleWatcher(pw, h.trigger, a.min_gap)
+    w.start()
     log(f"watching (model={MODEL}, cooldown={a.cooldown}s, dry_run={a.dry_run}) — Ctrl-C to stop")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # systemctl stop/restart → run the cleanup below
     try:
         while True:
             time.sleep(3600)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
+        # Give the camera its slot back now instead of leaving it leased for SUB_LIFETIME_S.
+        if w.addr:
+            w._unsubscribe(w.addr)
         log("bye")
 
 
