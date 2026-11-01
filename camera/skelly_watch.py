@@ -57,11 +57,16 @@ age, disability, gender, faces, hair (unless it is clearly part of a costume/wig
 - If someone has no costume, tease gently about that (e.g. "disguised as a regular human — bold"), never their person.
 - No names, no locations, no guesses about identity. Never mention cameras or AI.
 - 1–2 sentences, at most 30 words. Plain words only, no emoji, no stage directions, no asterisks.
-- Do not repeat these recent lines: {recent}
+- Do not repeat these recent lines: {recent}{candy_rule}
 
 Reply with JSON only: {{"people": <int>, "costumes": "<short description>", "skip": <bool>, "line": "<what the skeleton says>"}}.
 Set skip=true (line empty) if no person is clearly visible, or if the person looks like a delivery driver, mail carrier, \
 or someone not trick-or-treating (just passing or working)."""
+
+# SKELLY_CANDY_GONE=1 → end-of-night mode: still roast costumes, but wave visitors off instead of inviting them up.
+CANDY_GONE_RULE = ("\n- The candy is ALL GONE for the night. Make that clear in every line (the skeleton ate it, guarded it "
+                   "too well, the bowl is empty, etc.), and never invite anyone up to the door or promise treats.")
+CANDY_GONE = os.environ.get("SKELLY_CANDY_GONE", "") not in ("", "0")
 
 
 def _redact(s: str) -> str:
@@ -261,7 +266,8 @@ def vision_line(jpg: str, recent: list[str], model: str) -> dict:
         "max_tokens": 200,
         "temperature": 0.9,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT.format(recent=json.dumps(recent[-8:]))},
+            {"role": "system", "content": SYSTEM_PROMPT.format(
+                recent=json.dumps(recent[-8:]), candy_rule=CANDY_GONE_RULE if CANDY_GONE else "")},
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 {"type": "text", "text": "Porch camera frame. JSON only."},
