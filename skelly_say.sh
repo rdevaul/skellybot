@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # skelly_say.sh — text → Ming TTS on the DGX Spark → Raspberry Pi → Skelly (live A2DP).
 # Usage: ./skelly_say.sh "Happy Halloween, mortals." [--tempo 0.65]
-# Runs on the Mac (the orchestrating host): Spark is reachable on the lab LAN,
-# the Pi over Tailscale. Requires ming_server.py running on the Spark.
+# Runs on the Mac: Spark and Pi both over Tailscale (192.168.100.10 is the Spark's
+# wired link to old-glados only; see spark/README.md for the faster jump-host path).
+# Requires ming-tts.service running on the Spark.
 set -euo pipefail
 KEY=~/.ssh/id_ed25519_glados
-SPARK=${SKELLY_SPARK:-rich@192.168.100.10}
+SPARK=${SKELLY_SPARK:-rich@100.88.44.116}
 PI=${SKELLY_PI:-rich@100.84.5.92}
 TEXT="${1:?usage: skelly_say.sh \"text\" [--tempo T]}"; shift || true
 TEMPO_ARGS=()

@@ -5,7 +5,8 @@ Tapo C325WB ONVIF PeopleDetector event (local, no cloud)
   → RTSP frame grab → vision LLM (OpenRouter) writes a costume heckle
   → Ming TTS on the DGX Spark → skelly-daemon on the Pi (held-open A2DP link).
 
-Runs on the Mac. Stdlib only. Secrets via env: TAPO_PASS, OPENROUTER_API_KEY.
+Runs on the Pi (SKELLY_PI=local, as skelly-watch.service) or on the Mac. Stdlib only.
+Secrets via env: TAPO_PASS, OPENROUTER_API_KEY. Hosts: SKELLY_SPARK, SKELLY_PI (see camera/README.md).
 
   TAPO_PASS=... python3 camera/skelly_watch.py            # live
   TAPO_PASS=... python3 camera/skelly_watch.py --dry-run  # everything except playback
@@ -38,7 +39,7 @@ CAM = os.environ.get("TAPO_HOST", "192.168.4.110")
 CAM_USER = os.environ.get("TAPO_USER", "glados-ops")
 ONVIF_PORT = 2020
 KEY = os.path.expanduser("~/.ssh/id_ed25519_glados")
-SPARK = os.environ.get("SKELLY_SPARK", "rich@192.168.100.10")
+SPARK = os.environ.get("SKELLY_SPARK", "rich@100.88.44.116")   # Tailscale; the Pi uses spark-via-lan
 PI = os.environ.get("SKELLY_PI", "rich@100.84.5.92")
 PI_LOCAL = PI in ("local", "127.0.0.1", "localhost")  # watcher runs on the Pi itself
 MODEL = os.environ.get("SKELLY_VISION_MODEL", "anthropic/claude-sonnet-5.5")
