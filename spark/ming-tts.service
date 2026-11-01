@@ -9,6 +9,7 @@ User=rich
 Group=rich
 WorkingDirectory=/home/rich/ming-tts-src
 Environment=MING_SOCK=/home/rich/ming.sock
+Environment=MING_GAIN_DB=7
 ExecStart=/home/rich/ming-venv/bin/python /home/rich/skelly-spark/ming_server.py
 Restart=on-failure
 RestartSec=15

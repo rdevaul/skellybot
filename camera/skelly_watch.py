@@ -39,6 +39,7 @@ ONVIF_PORT = 2020
 KEY = os.path.expanduser("~/.ssh/id_ed25519_glados")
 SPARK = os.environ.get("SKELLY_SPARK", "rich@192.168.100.10")
 PI = os.environ.get("SKELLY_PI", "rich@100.84.5.92")
+PI_LOCAL = PI in ("local", "127.0.0.1", "localhost")  # watcher runs on the Pi itself
 MODEL = os.environ.get("SKELLY_VISION_MODEL", "anthropic/claude-sonnet-5.5")
 FALLBACK_MODEL = os.environ.get("SKELLY_VISION_FALLBACK", "anthropic/claude-haiku-5.5")
 LOG = Path(os.environ.get("SKELLY_WATCH_LOG", os.path.expanduser("~/Projects/skellybot/camera/watch_log.jsonl")))
@@ -118,34 +119,69 @@ class PeopleWatcher(threading.Thread):
             raise RuntimeError("no subscription address")
         return m.group(1)
 
+    STALE_S = 60           # no pull answered this long → Renew to check the subscription still exists
+
+    def _renew(self, addr: str) -> None:
+        _soap(addr, "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest",
+              '<wsnt:Renew xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">'
+              f"<wsnt:TerminationTime>PT{self.SUB_LIFETIME_S}S</wsnt:TerminationTime></wsnt:Renew>",
+              self.password, to=addr)
+
+    def _unsubscribe(self, addr: str) -> None:
+        # The Tapo has ~10 subscription slots; leaking them gets every new
+        # CreatePullPointSubscription a 400 until the leases expire.
+        try:
+            _soap(addr, "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/UnsubscribeRequest",
+                  '<wsnt:Unsubscribe xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"/>', self.password, to=addr)
+        except Exception as e:
+            log(f"onvif: unsubscribe failed {e!r}")
+
+    def _pull(self, addr: str) -> str:
+        return _soap(addr, "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest",
+                     "<tev:PullMessages><tev:Timeout>PT5S</tev:Timeout><tev:MessageLimit>20</tev:MessageLimit>"
+                     "</tev:PullMessages>", self.password, to=addr, timeout=10)
+
     def run(self):
         backoff = 5
         while True:
+            addr = None
             try:
                 addr = self._subscribe()
                 backoff = 5
-                born = time.time()
+                renewed = last_ok = time.time()
                 log(f"onvif: subscribed {addr}")
-                fails = 0
-                while time.time() - born < self.SUB_LIFETIME_S - 30 and fails < 30:
+                gap = 0.5          # pause between failed pulls; grows while the camera keeps hanging up
+                quiet_logged = False
+                while True:
+                    now = time.time()
+                    if now - renewed > self.SUB_LIFETIME_S / 2 or now - max(renewed, last_ok) > self.STALE_S:
+                        # Renew doubles as the liveness check: raises (→ resubscribe) if the
+                        # camera forgot the subscription, e.g. after a reboot.
+                        self._renew(addr)
+                        renewed = now
+                        if now - last_ok > self.STALE_S and not quiet_logged:
+                            log(f"onvif: no pull answered in {self.STALE_S}s but subscription alive")
+                            quiet_logged = True
                     try:
-                        r = _soap(addr, "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest",
-                                  "<tev:PullMessages><tev:Timeout>PT5S</tev:Timeout><tev:MessageLimit>20</tev:MessageLimit>"
-                                  "</tev:PullMessages>", self.password, to=addr, timeout=10)
-                        fails = 0
+                        r = self._pull(addr)
                     except urllib.error.HTTPError as e:
                         if e.code == 400:      # subscription invalidated — recreate now
                             raise RuntimeError("pull got 400, subscription stale")
-                        fails += 1
-                        time.sleep(0.5)
-                        self._decay()
-                        continue
+                        r = None
                     except Exception:
-                        # Tapo drops the long-poll when it has nothing to say; that's normal.
-                        fails += 1
-                        time.sleep(0.5)
+                        # Tapo hangs up on most PullMessages when it has nothing to report.
+                        # That's normal — events still arrive on the pulls it does answer —
+                        # so never resubscribe over it (that leaks the camera's ~10 slots).
+                        r = None
+                    if r is None:
+                        time.sleep(gap)
+                        gap = min(gap * 1.5, 2.0)
                         self._decay()
                         continue
+                    if quiet_logged:
+                        log(f"onvif: pulls answered again after {time.time() - last_ok:.0f}s")
+                        quiet_logged = False
+                    last_ok, gap = time.time(), 0.5
                     for m in re.findall(r"<wsnt:NotificationMessage>(.*?)</wsnt:NotificationMessage>", r, re.S):
                         if "PeopleDetector" not in m:
                             continue
@@ -155,6 +191,8 @@ class PeopleWatcher(threading.Thread):
                     self._decay()
             except Exception as e:
                 log(f"onvif: subscription error {e!r}; retry in {backoff}s")
+                if addr:
+                    self._unsubscribe(addr)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
@@ -239,11 +277,15 @@ def tts(line: str, out_wav: str) -> None:
 
 
 def play(wav: str) -> dict:
-    name = f"/tmp/watch_{int(time.time() * 1000)}.wav"
-    subprocess.run(["scp", "-q", "-i", KEY, "-o", "ControlMaster=auto", "-o", f"ControlPath={CTL_DIR}/%r@%h:%p",
-                    "-o", "ControlPersist=600", wav, f"{PI}:{name}"], check=True, timeout=60)
-    r = subprocess.run(ssh_base(PI) + [f"~/skelly-venv/bin/python ~/skelly_client.py play --prenorm {name}; rm -f {name}"],
-                       capture_output=True, text=True, timeout=240)
+    if PI_LOCAL:
+        r = subprocess.run(["/home/rich/skelly-venv/bin/python", "/home/rich/skelly_client.py",
+                            "play", "--prenorm", wav], capture_output=True, text=True, timeout=240)
+    else:
+        name = f"/tmp/watch_{int(time.time() * 1000)}.wav"
+        subprocess.run(["scp", "-q", "-i", KEY, "-o", "ControlMaster=auto", "-o", f"ControlPath={CTL_DIR}/%r@%h:%p",
+                        "-o", "ControlPersist=600", wav, f"{PI}:{name}"], check=True, timeout=60)
+        r = subprocess.run(ssh_base(PI) + [f"~/skelly-venv/bin/python ~/skelly_client.py play --prenorm {name}; rm -f {name}"],
+                           capture_output=True, text=True, timeout=240)
     try:
         return json.loads(r.stdout[r.stdout.index("{"):])
     except Exception:
@@ -251,8 +293,12 @@ def play(wav: str) -> dict:
 
 
 def daemon_ready() -> bool:
-    r = subprocess.run(ssh_base(PI) + ["~/skelly-venv/bin/python ~/skelly_client.py status"],
-                       capture_output=True, text=True, timeout=20)
+    if PI_LOCAL:
+        r = subprocess.run(["/home/rich/skelly-venv/bin/python", "/home/rich/skelly_client.py", "status"],
+                           capture_output=True, text=True, timeout=20)
+    else:
+        r = subprocess.run(ssh_base(PI) + ["~/skelly-venv/bin/python ~/skelly_client.py status"],
+                           capture_output=True, text=True, timeout=20)
     return '"READY"' in r.stdout
 
 
